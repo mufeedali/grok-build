@@ -194,6 +194,37 @@ fn device_file_openable(path: &Path) -> bool {
     }
 }
 
+/// Grant a profile path as either a directory or a single non-directory node.
+///
+/// nono's `allow_path` requires a directory and returns
+/// `Expected a directory but got a file` for files, sockets, and other
+/// non-directory nodes. Custom profiles list paths without a type tag, so we
+/// dispatch on the existing filesystem node. That lets profiles allow
+/// individual files (or other non-directory nodes) without aborting the whole
+/// sandbox apply.
+///
+/// On Linux, pathname AF_UNIX sockets (e.g. `$SSH_AUTH_SOCK`) are governed by
+/// the same Landlock filesystem rules as regular files, so `allow_file` is
+/// enough — no separate unix-socket capability is required.
+#[cfg(all(feature = "enforce", unix))]
+fn allow_profile_path(
+    caps: CapabilitySet,
+    path: &Path,
+    mode: AccessMode,
+) -> anyhow::Result<CapabilitySet> {
+    let Some(path_str) = path.to_str() else {
+        tracing::warn!(path = ?path, "Skipping non-UTF8 profile grant path");
+        return Ok(caps);
+    };
+
+    if path.is_dir() {
+        Ok(caps.allow_path(path_str, mode)?)
+    } else {
+        // Files, AF_UNIX sockets, devices, FIFOs, etc.
+        Ok(caps.allow_file(path_str, mode)?)
+    }
+}
+
 impl ProfileName {
     /// Convert this profile into a nono `CapabilitySet` for the given workspace.
     #[cfg(all(feature = "enforce", unix))]
@@ -232,32 +263,33 @@ impl ProfileName {
             caps = caps.allow_path("/", AccessMode::Read)?;
         }
 
-        // Explicit read-only paths — skip non-existent (nothing to read)
+        // Explicit read-only paths — skip non-existent (nothing to read).
+        // Paths may be directories *or* individual files/sockets; dispatch via
+        // `allow_profile_path` so a file grant never surfaces
+        // `Expected a directory but got a file` and aborts the whole apply.
         for path in &profile.read_only {
             if !path.exists() {
                 continue;
             }
-            let Some(path_str) = path.to_str() else {
-                tracing::warn!(path = ?path, "Skipping non-UTF8 read_only path");
-                continue;
-            };
-            caps = caps.allow_path(path_str, AccessMode::Read)?;
+            caps = allow_profile_path(caps, path, AccessMode::Read)?;
         }
 
-        // Read-write paths. nono/Landlock need the directory to exist at
-        // apply time (it opens an O_PATH fd), but new files within it can
-        // be created freely after the sandbox is applied. Pre-create
-        // directories like ~/.grok/ that may not exist on first run.
+        // Read-write paths. nono/Landlock need the node to exist at apply time
+        // (it opens an O_PATH fd). Missing entries are treated as directories
+        // and pre-created (e.g. ~/.grok on first run) so tools can create
+        // files inside them after the sandbox is applied. Existing non-directory
+        // nodes (files, sockets, …) are granted with allow_file.
         for path in &profile.read_write {
-            if !path.exists() && std::fs::create_dir_all(path).is_err() {
-                tracing::warn!(path = ?path, "read_write path does not exist and could not be created, skipping");
-                continue;
+            if !path.exists() {
+                if std::fs::create_dir_all(path).is_err() {
+                    tracing::warn!(
+                        path = ?path,
+                        "read_write path does not exist and could not be created, skipping"
+                    );
+                    continue;
+                }
             }
-            let Some(path_str) = path.to_str() else {
-                tracing::warn!(path = ?path, "Skipping non-UTF8 read_write path");
-                continue;
-            };
-            caps = caps.allow_path(path_str, AccessMode::ReadWrite)?;
+            caps = allow_profile_path(caps, path, AccessMode::ReadWrite)?;
         }
 
         // Device special files (character devices like /dev/null, /dev/tty, etc.).
@@ -936,5 +968,116 @@ read_write = ["/tmp/ci-artifacts"]
                 "expected /dev/fd to be a directory on this platform"
             );
         }
+    }
+
+    /// Regression: custom profiles must accept individual files (and other
+    /// non-directory nodes) in `read_only` / `read_write`. Passing a file to
+    /// nono's `allow_path` used to abort the whole sandbox with
+    /// `Expected a directory but got a file`.
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn custom_profile_allows_individual_file_paths() {
+        let workspace = std::env::temp_dir().join(format!(
+            "grok-sbx-file-grant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ro_file = workspace.join("read-me.txt");
+        let rw_file = workspace.join("write-me.txt");
+        std::fs::write(&ro_file, b"ro").unwrap();
+        std::fs::write(&rw_file, b"rw").unwrap();
+
+        let config = SandboxConfig {
+            profiles: HashMap::from([(
+                "files".to_string(),
+                ProfileConfig {
+                    extends: Some("workspace".to_string()),
+                    restrict_network: None,
+                    read_only: vec![ro_file.display().to_string()],
+                    read_write: vec![rw_file.display().to_string()],
+                    deny: vec![],
+                },
+            )]),
+        };
+
+        let result = ProfileName::Custom("files".to_string())
+            .to_capability_set_with_config(&workspace, &config);
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert!(
+            result.is_ok(),
+            "custom profile must grant file paths without ExpectedDirectory: {:?}",
+            result.err()
+        );
+    }
+
+    /// Non-directory nodes that are not regular files (e.g. pathname AF_UNIX
+    /// sockets) must also go through `allow_file`, not `allow_path`.
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn custom_profile_allows_non_directory_socket_paths() {
+        let workspace = std::env::temp_dir().join(format!(
+            "grok-sbx-sock-grant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sock_path = workspace.join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        assert!(!sock_path.is_dir());
+
+        let config = SandboxConfig {
+            profiles: HashMap::from([(
+                "sock".to_string(),
+                ProfileConfig {
+                    extends: Some("workspace".to_string()),
+                    restrict_network: None,
+                    read_only: vec![],
+                    read_write: vec![sock_path.display().to_string()],
+                    deny: vec![],
+                },
+            )]),
+        };
+
+        let result = ProfileName::Custom("sock".to_string())
+            .to_capability_set_with_config(&workspace, &config);
+        drop(_listener);
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert!(
+            result.is_ok(),
+            "socket path must not abort capability set build: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn allow_profile_path_dispatches_dir_vs_file() {
+        let base = std::env::temp_dir().join(format!(
+            "grok-sbx-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let caps = CapabilitySet::new();
+        let caps = allow_profile_path(caps, &base, AccessMode::Read).expect("directory grant");
+        let caps = allow_profile_path(caps, &file, AccessMode::ReadWrite).expect("file grant");
+        assert!(
+            allow_profile_path(caps, &file, AccessMode::Read).is_ok(),
+            "re-granting a file path must stay Ok"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

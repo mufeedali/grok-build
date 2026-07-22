@@ -57,10 +57,10 @@ Create custom sandbox profiles in `~/.grok/sandbox.toml` (global) or `.grok/sand
 extends = "workspace"
 restrict_network = true
 
-# Paths the agent can read but NOT write/delete
-read_only = ["/data"]
+# Paths the agent can read but NOT write/delete (dirs or individual files)
+read_only = ["/data", "/etc/ssl/certs/ca-certificates.crt"]
 
-# Additional writable paths
+# Additional writable paths (dirs or individual files)
 read_write = ["/tmp/scratch"]
 
 # Paths or globs to kernel-deny (read + write/rename, enforced; see notes below)
@@ -83,9 +83,9 @@ When the global and per-project files define the same custom profile name, the u
 | ------------------ | -------- | ---------------------------------------------------- |
 | `extends`          | String   | Base built-in profile to inherit from (`workspace`, `devbox`, `read-only`, `strict`). Defaults to `workspace` when omitted |
 | `restrict_network` | Boolean  | Block network access for child processes             |
-| `read_only`        | String[] | Additional read-only paths                           |
-| `read_write`       | String[] | Additional read-write paths                          |
-| `deny`             | String[] | Paths or globs to kernel-deny (read + write/rename; see notes). An entry with `*`, `?`, or `[` is a glob |
+| `read_only`        | String[] | Additional read-only paths (directories **or** individual files) |
+| `read_write`       | String[] | Additional read-write paths (directories **or** individual files) |
+| `deny`             | String[] | Paths or globs to kernel-deny (read + write/rename; see notes). An entry with `*`, `?`, or `[` is a glob. May name individual files |
 
 > **Note on `deny`:** A non-empty `deny` list is **kernel-enforced**. Denied paths
 > are **read-denied and write/rename-denied** via Seatbelt on macOS and a bwrap
